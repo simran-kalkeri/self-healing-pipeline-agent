@@ -201,12 +201,19 @@ def inject_failures(df: pd.DataFrame, failure_type: str) -> pd.DataFrame:
 
     elif failure_type == "NEAR_GOAL":
         # Mild label noise: flip ~10% of labels randomly.
-        # Brings F1 from ~0.87 down to ~0.77-0.79 → near_goal=True
+        # Brings F1 from ~0.87 down to ~0.75-0.77 → near_goal=True
         # Agent must recognise it's close and prefer TUNE_HYPERPARAMETERS.
         rng  = np.random.default_rng(7)
         mask = rng.random(len(df)) < 0.10
         df.loc[mask, TARGET_COLUMN] = 1 - df.loc[mask, TARGET_COLUMN]
         # ← no print: agent must infer from low-but-close F1
+
+    elif failure_type == "PARTIAL_CORRUPTION":
+        # 30% of income silently → NaN (column exists but corrupted).
+        # Agent must detect high null rate and apply CAST_DATATYPE.
+        mask = rng.random(len(df)) < 0.30
+        df.loc[mask, "income"] = np.nan
+        # ← no print: agent must detect null rate from detector
 
     return df
 
@@ -500,13 +507,32 @@ def decision(state: PipelineState) -> PipelineState:
                 "reasoning":  "no new or retryable actions available",
                 "confidence": 1.0}
 
+    # ── Hard rule: near goal → FORCE TUNE_HYPERPARAMETERS immediately ──────────────
+    # Bypass LLM entirely — no ambiguity, no truncation risk, no wasted tokens.
+    if (near_goal
+            and "TUNE_HYPERPARAMETERS" not in tried_actions
+            and "TUNE_HYPERPARAMETERS" not in failed_actions):
+        print("[DECISION]  🎯 Near goal → FORCING TUNE_HYPERPARAMETERS (precision rule)")
+        return {**state,
+                "action":     "TUNE_HYPERPARAMETERS",
+                "root_cause": "F1 is near goal threshold",
+                "reasoning":  "hard rule: tune hyperparameters before any other action when near goal",
+                "confidence": 1.0}
+
+    # ── Rank available actions by score for LLM guidance ─────────────────────────
+    ranked_actions = sorted(
+        available,
+        key=lambda a: action_scores.get(a, 0.0),
+        reverse=True,
+    )
+
     # ── Build context and call LLM ──────────────────────────────────────────
     ctx = build_llm_context(state)
     user_message = (
         f"Pipeline error: {error}\n"
         f"Near goal: {near_goal}  |  Goal distance: {goal_distance:+.4f}\n"
         f"Tried actions: {sorted(tried_actions)}\n"
-        f"Available actions: {sorted(available)}\n"
+        f"Recommended actions (ranked by past score): {ranked_actions}\n"
         f"Ineffective (avoid): {sorted(failed_actions)}\n"
         f"Dataset:\n{dataset_summary(state['df'])}\n\n"
         f"Context:\n{ctx}"
